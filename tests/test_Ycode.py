@@ -1,7 +1,7 @@
 import pytest
-from Ycode import AgentStop, Agent, Thought, ToolCall
+from Ycode import AgentStop, Agent, Thought, ToolCall, Brain, BRAINS
 
-class FakeBrain:
+class FakeBrain(Brain):
     """fake brain for testing - returns predictable responses"""
     def __init__(self, responses=None):
         self.responses = responses or [Thought(text="Fake response")]
@@ -56,6 +56,45 @@ def test_conversation_accumulates():
 
     agent.handle_input("Second Message")
     assert len(agent.conversation) == 4 # 2 users + 2 asssistants
+
+# --- New tests for Chapter 4: Multiple Brains ---
+
+def test_agent_stores_brain_name():
+    """Verify agent stores the brain name."""
+    agent = Agent(brain=FakeBrain(), brain_name="claude")
+    assert agent.brain_name == "claude"
+
+    agent = Agent(brain=FakeBrain(), brain_name="deepseek")
+    assert agent.brain_name == "deepseek"
+
+def test_brains_registry_has_expected_providers():
+    """Verify BRAINS registry contains expected providers."""
+    assert "gemini" in BRAINS
+
+def test_switch_command_toggles_brain_name():
+    """Verify /switch updates brain_name (using FakeBrain for both)."""
+    agent = Agent(brain=FakeBrain(), brain_name="gemini")
+
+    # Mock BRAINS to use FakeBrain for switching
+    original_brains = BRAINS.copy()
+    BRAINS["gemini"] = FakeBrain
+
+    try:
+        # result = agent.handle_input("/switch")
+        # assert "deepseek" in result
+        # assert agent.brain_name == "deepseek"
+
+        # result = agent.handle_input("/switch")
+        # assert "claude" in result
+        # assert agent.brain_name == "claude"
+
+        result = agent.handle_input("/switch")
+        assert "gemini" in result
+        assert agent.brain_name == "gemini"
+    finally:
+        BRAINS.clear()
+        BRAINS.update(original_brains)
+
 
 def test_conversation_contains_correct_roles():
     """Verify conversation has correct role alternation."""

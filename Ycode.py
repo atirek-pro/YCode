@@ -1,9 +1,41 @@
 import os
+import time
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- HTTP Helpers ---
+
+def request_with_retry(url, headers, payload, max_retries=10):
+    """Make HTTP POST with retry on rate limit (429), server errors (5xx), and network failures."""
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
+        except requests.exceptions.RequestException as e:
+            wait_time = 2 ** attempt
+            print(f"Network error: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code == 429 or response.status_code >= 500:
+            retry_after = response.headers.get("retry-after")
+            try:
+                wait_time = int(retry_after) if retry_after else 2 ** attempt
+            except (ValueError, TypeError):
+                wait_time = 2 ** attempt
+            print(f"Error {response.status_code}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code >= 400:
+            try:
+                error_msg = response.json()["error"]["message"]
+            except (KeyError, ValueError):
+                error_msg = response.text
+            raise Exception(f"API error ({response.status_code}): {error_msg}")
+        return response
+    raise Exception(f"Request Failed after {max_retries} retries")
 
 # --- Exceptions ---
 
@@ -31,10 +63,19 @@ class Thought:
         self.tool_calls = tool_calls or []  # list of ToolCall
         self.thinking = thinking  # str or None
 
+# --- Brain Interface ---
+class Brain:
+    """Base class for LLM providers."""
+
+    def think(self, conversation):
+        raise NotImplementedError
+
+    def _parse_response(self, response):
+        raise NotImplementedError
 
 # --- Gemini (The Brain) ---
 
-class Gemini:
+class Gemini(Brain):
     """Gemini API - the brain of our agent."""
 
     def __init__(self):
@@ -73,19 +114,11 @@ class Gemini:
             }
         }
 
-        response = requests.post(
+        response = request_with_retry(
             self.url,
             headers=headers,
-            json=payload,
-            timeout=120
+            json=payload
         )
-
-        # Useful while developing
-        if not response.ok:
-            print("Gemini API Error:")
-            print(response.text)
-
-        response.raise_for_status()
 
         return self._parse_response(response.json())
 
@@ -169,19 +202,28 @@ class Gemini:
             if thinking_parts else None
         )
 
+# Available brains
+BRAINS = {
+    "gemini": Gemini
+}
+
 # --- Agent Class ---
 
 class Agent:
     """A coding agent with conversation memory."""
 
-    def __init__(self, brain):
+    def __init__(self, brain, brain_name="gemini"):
         self.brain = brain
+        self.brain_name = brain_name
         self.conversation = []
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
         if user_input.strip() == "/q":
             raise AgentStop()
+
+        if user_input.strip() == "/switch":
+            return self._switch_brain()
 
         if not user_input.strip():
             return ""
@@ -202,18 +244,33 @@ class Agent:
             self.conversation.pop()  # Remove failed user message
             return f"Error: {e}"
 
+    def _switch_brain(self):
+        "Toggle to the next brain"
+        names = list(BRAINS.keys())
+        idx = names.index(self.brain_name)
+        new_name = names[(idx + 1)%len(names)]
+
+        try:
+            self.brain = BRAINS[new_name]()
+            self.brain_name = new_name
+            return f"Switched to: {new_name}"
+        except ValueError as e:
+            return f"Cannot switch to {new_name}: {e}"
+
 
 # --- Main Loop ---
 
 def main():
-    brain = Gemini()
-    agent = Agent(brain)
-    print("⚡ Nanocode v0.2 (Conversation Memory)")
-    print("Type '/q' to quit.\n")
+    brain_name = os.getenv("YCode_BRAIN", "gemini")
+    brain = BRAINS[brain_name]()
+    agent = Agent(brain, brain_name)
+    print("⚡ Nanocode v0.3")
+    print(f"Commands: /q quit, /switch toggle brain")
+    print(f"Brain: {brain_name}\n")
 
     while True:
         try:
-            user_input = input(">>")
+            user_input = input(f"[{agent.brain_name}]>>")
             output = agent.handle_input(user_input)
             if output:
                 print(f"\n{output}\n")

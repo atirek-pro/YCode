@@ -4,3 +4,4 @@ __pycache__/
 pytest.ini
 .env
 .DS_Store
+.Ycode-Memory/

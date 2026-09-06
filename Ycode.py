@@ -64,6 +64,40 @@ class Thought:
         self.raw_content = raw_content # original API response from message history
         self.thinking = thinking  # str or None
 
+# --- Memory Class ---
+class Memory:
+    """Persistent scratchpad for the agent."""
+    def __init__(self, path=".Ycode-Memory/memory.md"):
+        self.path = path
+        self._ensure_exists()
+        self.content = self._load()
+
+    def _ensure_exists(self):
+        """Create memory file with default content if needed."""
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if not os.path.exists(self.path):
+            default = "I am Ycode, a helpful coding assistant.\n"
+            with open(self.path, "w") as f:
+                f.write(default)
+
+    def _load(self):
+        "Load Content from disk"
+        with open(self.path, "r") as f:
+            return f.read()
+
+    def save(self, content):
+        "Update memory content and persists to disk"
+        self.content = content
+        with open(self.path, "w") as f:
+            f.write(content)
+
+# --- Tool Context ---
+class ToolContext:
+    "What tools need to know about the agent's state"
+    def __init__(self, memory=None):
+        self.memory = memory # Memory object or None
+
+
 # --- Brain Interface ---
 
 class Brain:
@@ -82,7 +116,8 @@ class Brain:
 class Gemini(Brain):
     """Gemini API - the brain of our agent."""
 
-    def __init__(self, tools=None):
+    def __init__(self, memory=None, tools=None):
+        self.memory = memory
         self.tools = tools or []
         self.api_key = os.getenv("GEMINI_API_KEY")
 
@@ -119,8 +154,24 @@ class Gemini(Brain):
             }
         }
 
-        gemini_tools = self._convert_tools()
+        if self.memory and self.memory.content.strip():
+            payload["systemInstruction"] = {
+                "parts": [ 
+                    { 
+                        "text": ( 
+                            "You are Ycode, a helpful coding assistant.\n\n" "Here is your persistent memory. " 
+                            "Use it to maintain context about the user " "and previous interactions. " 
+                            "Do not mention or expose the memory system " 
+                            "unless relevant.\n\n" "=== MEMORY ===\n" 
+                            f"{self.memory.content}\n" 
+                            "=== END MEMORY ===" 
+                        ) 
+                    } 
+                ]
+            }
 
+        gemini_tools = self._convert_tools()
+        
         if gemini_tools:
             payload["tools"] = gemini_tools
 
@@ -304,7 +355,7 @@ class ReadFile:
         "required": ["path"]
     }
 
-    def execute(self, path):
+    def execute(self, context, path):
         print(f"--> Reading {path}")
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -333,7 +384,7 @@ class WriteFile:
         "required": ["path", "content"]
     }
 
-    def execute(self, path, content):
+    def execute(self, context, path, content):
         print(f"--> Writting{path}")
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -341,6 +392,26 @@ class WriteFile:
                 return f"Successfully wrote {len(content)} characters to {path}"
         except Exception as e:
             return f"Error writting file: {e}"
+
+class Savememory:
+    """Updates the agent's internal memory/scratchpad."""
+    name = "save_memory"
+    description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The full text to save."}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print(f"--> Saving Memory")
+        if context.memory is None:
+            return "Error: Memory not available"
+        context.memory.save(content)
+        return "Memory updated successfully"
+
 
 # Tool helpers
 def get_tool(tools, name):
@@ -358,16 +429,17 @@ def tool_definitions(tools):
         for t in tools
     ]
 
-tools = [ReadFile(), WriteFile()]
+tools = [ReadFile(), WriteFile(), Savememory()]
 
 # --- Agent Class ---
 
 class Agent:
     """A coding agent with conversation memory."""
 
-    def __init__(self, brain, tools, brain_name="gemini"):
+    def __init__(self, brain, tools, memory, brain_name="gemini"):
         self.brain = brain
         self.tools = list(tools)
+        self.memory = memory
         self.brain_name = brain_name
         self.conversation = []
 
@@ -401,7 +473,7 @@ class Agent:
         new_name = names[(idx + 1)%len(names)]
 
         try:
-            self.brain = BRAINS[new_name](tools=tool_definitions(self.tools))
+            self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
@@ -492,7 +564,8 @@ class Agent:
         if tool is None:
             return f"Error: Tool '{name}' not found"
         try:
-            return tool.execute(**args)
+            context = ToolContext(memory=self.memory)
+            return tool.execute(context=context, **args)
         except TypeError as e:
             return f"Error: Invalid arguments - {e}"
 
@@ -500,9 +573,10 @@ class Agent:
 
 def main():
     brain_name = os.getenv("YCode_BRAIN", "gemini")
-    brain = BRAINS[brain_name](tools=tool_definitions(tools))
-    agent = Agent(brain=brain, tools=tools, brain_name=brain_name)
-    print("⚡ Nanocode v0.3")
+    memory = Memory()
+    brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
+    agent = Agent(brain=brain, tools=tools, memory=memory, brain_name=brain_name)
+    print("⚡ Nanocode v0.5 (Memory Enabled)")
     print(f"Commands: /q quit, /switch toggle brain")
     print(f"Brain: {brain_name}\n")
 

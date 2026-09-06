@@ -1,5 +1,6 @@
 import os
 import tempfile
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -12,7 +13,10 @@ from Ycode import (
     BRAINS,
     ReadFile,
     WriteFile,
+    Savememory,
     Gemini,
+    Memory,
+    ToolContext,
     tool_definitions,
     tools,
 )
@@ -25,12 +29,14 @@ from Ycode import (
 class FakeBrain(Brain):
     """Fake brain for testing predictable agent behavior."""
 
-    def __init__(self, responses=None):
+    def __init__(self, responses=None, memory=None, tools=None):
         self.responses = responses or [
             Thought(text="Fake response")
         ]
         self.call_count = 0
         self.last_conversation = None
+        self.memory = memory
+        self.tools = tools or []
 
     def think(self, conversation):
         self.last_conversation = list(conversation)
@@ -43,8 +49,35 @@ class FakeBrain(Brain):
         return Thought(text="No more responses")
 
     def _parse_response(self, response):
-        """Fake implementation required by Brain interface."""
         raise NotImplementedError
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def make_memory():
+    """Create an isolated temporary Memory instance."""
+    tmpdir = tempfile.TemporaryDirectory()
+    path = os.path.join(tmpdir.name, "memory.md")
+    memory = Memory(path=path)
+    return tmpdir, memory
+
+
+def make_agent(brain=None, memory=None, brain_name="gemini"):
+    """Create an Agent using the current Ycode constructor."""
+    if memory is None:
+        _, memory = make_memory()
+
+    if brain is None:
+        brain = FakeBrain(memory=memory, tools=tool_definitions(tools))
+
+    return Agent(
+        brain=brain,
+        tools=tools,
+        memory=memory,
+        brain_name=brain_name,
+    )
 
 
 # ============================================================
@@ -53,20 +86,36 @@ class FakeBrain(Brain):
 
 def test_quit_command_raises_agent_stop():
     """Verify /q raises AgentStop exception."""
-    agent = Agent(
-        brain=FakeBrain(),
-        tools=tools
-    )
 
-    with pytest.raises(AgentStop):
-        agent.handle_input("/q")
+    _, memory = make_memory()
+
+    try:
+        agent = Agent(
+            brain=FakeBrain(),
+            tools=tools,
+            memory=memory,
+        )
+
+        with pytest.raises(AgentStop):
+            agent.handle_input("/q")
+
+    finally:
+        memory_path = memory.path
+        memory_dir = os.path.dirname(memory_path)
+
+        # TemporaryDirectory owns cleanup.
+        # Nothing else is required here.
 
 
 def test_quit_command_with_whitespace():
     """Verify /q works with surrounding whitespace."""
+
+    _, memory = make_memory()
+
     agent = Agent(
         brain=FakeBrain(),
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     with pytest.raises(AgentStop):
@@ -75,9 +124,13 @@ def test_quit_command_with_whitespace():
 
 def test_empty_input_returns_empty_string():
     """Verify empty/whitespace input returns empty string."""
+
+    _, memory = make_memory()
+
     agent = Agent(
         brain=FakeBrain(),
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     assert agent.handle_input("") == ""
@@ -88,6 +141,8 @@ def test_empty_input_returns_empty_string():
 def test_handle_input_returns_brain_response():
     """Verify handle_input returns the brain's response text."""
 
+    _, memory = make_memory()
+
     brain = FakeBrain(
         responses=[
             Thought(text="Hello from brain")
@@ -96,7 +151,8 @@ def test_handle_input_returns_brain_response():
 
     agent = Agent(
         brain=brain,
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     result = agent.handle_input("hi")
@@ -105,7 +161,9 @@ def test_handle_input_returns_brain_response():
 
 
 def test_conversation_accumulates():
-    """Verify conversation list grows with each interaction."""
+    """Verify conversation list grows with each user interaction."""
+
+    _, memory = make_memory()
 
     brain = FakeBrain(
         responses=[
@@ -116,14 +174,12 @@ def test_conversation_accumulates():
 
     agent = Agent(
         brain=brain,
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     agent.handle_input("First Message")
 
-    # Only the user message is stored because the
-    # updated agentic loop does not append normal
-    # assistant text to conversation.
     assert len(agent.conversation) == 1
 
     agent.handle_input("Second Message")
@@ -132,16 +188,19 @@ def test_conversation_accumulates():
 
 
 # ============================================================
-# Multiple Brain Tests
+# Brain Tests
 # ============================================================
 
 def test_agent_stores_brain_name():
     """Verify agent stores the brain name."""
 
+    _, memory = make_memory()
+
     agent = Agent(
         brain=FakeBrain(),
         tools=tools,
-        brain_name="claude"
+        memory=memory,
+        brain_name="claude",
     )
 
     assert agent.brain_name == "claude"
@@ -149,29 +208,63 @@ def test_agent_stores_brain_name():
     agent = Agent(
         brain=FakeBrain(),
         tools=tools,
-        brain_name="deepseek"
+        memory=memory,
+        brain_name="deepseek",
     )
 
     assert agent.brain_name == "deepseek"
 
 
 def test_brains_registry_has_expected_providers():
-    """Verify BRAINS registry contains expected providers."""
+    """Verify BRAINS registry contains Gemini."""
 
     assert "gemini" in BRAINS
+
+
+def test_switch_command_reinitializes_brain():
+    """
+    Verify /switch reinitializes the selected brain.
+
+    Currently BRAINS only contains Gemini, so /switch
+    switches from Gemini back to Gemini.
+    """
+
+    _, memory = make_memory()
+
+    agent = Agent(
+        brain=FakeBrain(memory=memory),
+        tools=tools,
+        memory=memory,
+        brain_name="gemini",
+    )
+
+    original_brains = BRAINS.copy()
+
+    try:
+        BRAINS["gemini"] = FakeBrain
+
+        result = agent.handle_input("/switch")
+
+        assert result == "Switched to: gemini"
+        assert agent.brain_name == "gemini"
+        assert isinstance(agent.brain, FakeBrain)
+
+        # Most importantly, the same Memory instance is preserved.
+        assert agent.brain.memory is memory
+
+    finally:
+        BRAINS.clear()
+        BRAINS.update(original_brains)
+
 
 # ============================================================
 # Conversation Tests
 # ============================================================
 
 def test_conversation_contains_correct_roles():
-    """
-    Verify user input is stored correctly.
+    """Verify user input is stored correctly."""
 
-    Normal assistant responses are no longer stored as
-    plain assistant messages because the agentic loop only
-    preserves model responses when tool calls occur.
-    """
+    _, memory = make_memory()
 
     brain = FakeBrain(
         responses=[
@@ -181,7 +274,8 @@ def test_conversation_contains_correct_roles():
 
     agent = Agent(
         brain=brain,
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     agent.handle_input("User message")
@@ -193,11 +287,14 @@ def test_conversation_contains_correct_roles():
 def test_brain_receives_conversation():
     """Verify brain.think receives the conversation list."""
 
+    _, memory = make_memory()
+
     brain = FakeBrain()
 
     agent = Agent(
         brain=brain,
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     agent.handle_input("Test message")
@@ -210,14 +307,16 @@ def test_brain_receives_conversation():
 
 def test_failed_brain_call_preserves_user_message():
     """
-    Verify failed brain calls return an error.
-
-    The updated handle_input() no longer removes the user
-    message automatically, so the failed request remains
-    in conversation history.
+    Verify failed brain calls return an error and the
+    user message remains in conversation history.
     """
 
+    _, memory = make_memory()
+
     class FailingBrain(Brain):
+
+        def __init__(self):
+            self.memory = memory
 
         def think(self, conversation):
             raise Exception("API Error")
@@ -227,15 +326,13 @@ def test_failed_brain_call_preserves_user_message():
 
     agent = Agent(
         brain=FailingBrain(),
-        tools=tools
+        tools=tools,
+        memory=memory,
     )
 
     result = agent.handle_input("Test message")
 
     assert "Error" in result
-
-    # Updated behavior:
-    # user message remains in conversation.
     assert len(agent.conversation) == 1
     assert agent.conversation[0]["role"] == "user"
     assert agent.conversation[0]["content"] == "Test message"
@@ -246,7 +343,7 @@ def test_failed_brain_call_preserves_user_message():
 # ============================================================
 
 def test_tool_has_required_attributes():
-    """Verify tool classes have name, description, and input_schema."""
+    """Verify tool classes have required attributes."""
 
     tool = ReadFile()
 
@@ -256,7 +353,7 @@ def test_tool_has_required_attributes():
 
 
 def test_write_file_has_valid_input_schema():
-    """Verify WriteFile has a valid JSON-schema-style input definition."""
+    """Verify WriteFile has a valid JSON-schema-style definition."""
 
     tool = WriteFile()
 
@@ -264,11 +361,42 @@ def test_write_file_has_valid_input_schema():
     assert "path" in tool.input_schema["properties"]
     assert "content" in tool.input_schema["properties"]
 
-    # required must be a list, not a Python set
     assert tool.input_schema["required"] == [
         "path",
-        "content"
+        "content",
     ]
+
+
+def test_save_memory_has_valid_input_schema():
+    """Verify Savememory has the expected schema."""
+
+    tool = Savememory()
+
+    assert tool.name == "save_memory"
+    assert tool.input_schema["type"] == "object"
+    assert "content" in tool.input_schema["properties"]
+    assert tool.input_schema["required"] == ["content"]
+
+
+def test_tool_definitions_are_provider_neutral():
+    """Verify tool_definitions returns the expected internal format."""
+
+    definitions = tool_definitions(tools)
+
+    assert len(definitions) == 3
+
+    names = {tool["name"] for tool in definitions}
+
+    assert names == {
+        "read_file",
+        "write_file",
+        "save_memory",
+    }
+
+    for definition in definitions:
+        assert "name" in definition
+        assert "description" in definition
+        assert "input_schema" in definition
 
 
 # ============================================================
@@ -281,9 +409,10 @@ def test_gemini_converts_tools_to_function_declarations():
     Gemini's functionDeclarations format.
     """
 
-    brain = Gemini(
-        tools=tool_definitions(tools)
-    )
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        brain = Gemini(
+            tools=tool_definitions(tools)
+        )
 
     converted_tools = brain._convert_tools()
 
@@ -294,7 +423,7 @@ def test_gemini_converts_tools_to_function_declarations():
         "functionDeclarations"
     ]
 
-    assert len(function_declarations) == 2
+    assert len(function_declarations) == 3
 
     read_file = next(
         tool
@@ -308,11 +437,20 @@ def test_gemini_converts_tools_to_function_declarations():
         if tool["name"] == "write_file"
     )
 
+    save_memory = next(
+        tool
+        for tool in function_declarations
+        if tool["name"] == "save_memory"
+    )
+
     assert read_file["description"] == ReadFile.description
     assert read_file["parameters"] == ReadFile.input_schema
 
     assert write_file["description"] == WriteFile.description
     assert write_file["parameters"] == WriteFile.input_schema
+
+    assert save_memory["description"] == Savememory.description
+    assert save_memory["parameters"] == Savememory.input_schema
 
 
 # ============================================================
@@ -325,7 +463,8 @@ def test_read_file_adds_line_numbers():
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
-        delete=False
+        delete=False,
+        encoding="utf-8",
     ) as f:
 
         f.write(
@@ -337,10 +476,14 @@ def test_read_file_adds_line_numbers():
         temp_path = f.name
 
     try:
-
         tool = ReadFile()
 
-        result = tool.execute(temp_path)
+        context = ToolContext()
+
+        result = tool.execute(
+            context,
+            temp_path,
+        )
 
         assert "1 | line one" in result
         assert "2 | line two" in result
@@ -349,7 +492,6 @@ def test_read_file_adds_line_numbers():
     finally:
         os.unlink(temp_path)
 
-
 def test_write_file_creates_file():
     """Verify WriteFile creates a file with content."""
 
@@ -357,14 +499,17 @@ def test_write_file_creates_file():
 
         path = os.path.join(
             tmpdir,
-            "test.txt"
+            "test.txt",
         )
 
         tool = WriteFile()
 
+        context = ToolContext()
+
         result = tool.execute(
+            context,
             path,
-            "hello world"
+            "hello world",
         )
 
         assert os.path.exists(path)
@@ -373,10 +518,169 @@ def test_write_file_creates_file():
 
         with open(
             path,
-            encoding="utf-8"
+            encoding="utf-8",
         ) as f:
 
             assert f.read() == "hello world"
+
+
+# ============================================================
+# Memory Class Tests
+# ============================================================
+
+def test_memory_creates_default_file():
+    """Verify Memory creates file with default content."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        path = os.path.join(
+            tmpdir,
+            "memory.md",
+        )
+
+        memory = Memory(path=path)
+
+        assert os.path.exists(path)
+        assert "I am Ycode" in memory.content
+
+
+def test_memory_save_updates_content_and_file():
+    """Verify Memory.save updates memory and persists to disk."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        path = os.path.join(
+            tmpdir,
+            "memory.md",
+        )
+
+        memory = Memory(path=path)
+
+        memory.save("New content")
+
+        assert memory.content == "New content"
+
+        with open(path, encoding="utf-8") as f:
+            assert f.read() == "New content"
+
+
+def test_memory_reloads_persisted_content():
+    """Verify saved memory survives creating a new Memory instance."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        path = os.path.join(
+            tmpdir,
+            "memory.md",
+        )
+
+        memory = Memory(path=path)
+
+        memory.save("Persistent memory")
+
+        new_memory = Memory(path=path)
+
+        assert new_memory.content == "Persistent memory"
+
+
+# ============================================================
+# ToolContext Tests
+# ============================================================
+
+def test_tool_context_contains_memory():
+    """Verify ToolContext stores the Memory instance."""
+
+    _, memory = make_memory()
+
+    context = ToolContext(memory=memory)
+
+    assert context.memory is memory
+
+
+# ============================================================
+# SaveMemory Tool Tests
+# ============================================================
+
+def test_save_memory_updates_memory():
+    """Verify Savememory updates the Memory object."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        memory = Memory(
+            path=os.path.join(
+                tmpdir,
+                "memory.md",
+            )
+        )
+
+        tool = Savememory()
+        context = ToolContext(memory=memory)
+
+        result = tool.execute(
+            context,
+            "Updated preferences",
+        )
+
+        assert "successfully" in result.lower()
+        assert memory.content == "Updated preferences"
+
+        with open(memory.path, encoding="utf-8") as f:
+            assert f.read() == "Updated preferences"
+
+
+def test_save_memory_without_memory_returns_error():
+    """Verify SaveMemory handles missing memory context."""
+
+    tool = Savememory()
+    context = ToolContext(memory=None)
+
+    result = tool.execute(
+        context,
+        "Some memory",
+    )
+
+    assert result == "Error: Memory not available"
+
+
+# ============================================================
+# Agent Tool Execution Tests
+# ============================================================
+
+def test_agent_executes_save_memory_with_context():
+    """
+    Verify Agent._execute_tool passes ToolContext correctly.
+
+    This specifically protects against the bug where context was
+    created but not passed to tool.execute().
+    """
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        memory = Memory(
+            path=os.path.join(
+                tmpdir,
+                "memory.md",
+            )
+        )
+
+        agent = Agent(
+            brain=FakeBrain(),
+            tools=tools,
+            memory=memory,
+        )
+
+        result = agent._execute_tool(
+            "save_memory",
+            {
+                "content": "User prefers Python"
+            },
+        )
+
+        assert result == "Memory updated successfully"
+        assert memory.content == "User prefers Python"
+
+        with open(memory.path, encoding="utf-8") as f:
+            assert f.read() == "User prefers Python"
 
 
 # ============================================================
@@ -398,13 +702,16 @@ def test_agentic_loop_executes_tool_calls():
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
-        delete=False
+        delete=False,
+        encoding="utf-8",
     ) as f:
 
         f.write("test content\n")
         temp_path = f.name
 
     try:
+
+        _, memory = make_memory()
 
         brain = FakeBrain(
             responses=[
@@ -417,7 +724,7 @@ def test_agentic_loop_executes_tool_calls():
                             name="read_file",
                             args={
                                 "path": temp_path
-                            }
+                            },
                         )
                     ],
 
@@ -433,11 +740,11 @@ def test_agentic_loop_executes_tool_calls():
                                     "args": {
                                         "path": temp_path
                                     },
-                                    "id": "1"
-                                }
-                            }
-                        ]
-                    }
+                                    "id": "1",
+                                },
+                            },
+                        ],
+                    },
                 ),
 
                 Thought(
@@ -453,47 +760,39 @@ def test_agentic_loop_executes_tool_calls():
                                     "test content."
                                 )
                             }
-                        ]
-                    }
-                )
+                        ],
+                    },
+                ),
             ]
         )
 
         agent = Agent(
             brain=brain,
-            tools=tools
+            tools=tools,
+            memory=memory,
         )
 
         result = agent.handle_input(
             "Read the file"
         )
 
-        # Both model responses should be returned.
         assert "Let me read that file." in result
         assert "The file contains test content." in result
 
-        # Brain called twice:
-        # 1. Initial request → tool call
-        # 2. Tool result → final response
         assert brain.call_count == 2
-
-        # --------------------------------------------------------
-        # Verify conversation structure
-        # --------------------------------------------------------
 
         assert len(agent.conversation) == 3
 
-        # 1. Original user message
+        # Original user message
         assert agent.conversation[0] == {
             "role": "user",
-            "content": "Read the file"
+            "content": "Read the file",
         }
 
-        # 2. Gemini model response
+        # Gemini model response
         model_message = agent.conversation[1]
 
         assert model_message["role"] == "assistant"
-
         assert (
             model_message["content"]["role"]
             == "model"
@@ -506,10 +805,9 @@ def test_agentic_loop_executes_tool_calls():
         )
 
         assert function_call["name"] == "read_file"
-
         assert function_call["id"] == "1"
 
-        # 3. Provider-neutral tool result
+        # Provider-neutral tool result
         tool_result_message = agent.conversation[2]
 
         assert tool_result_message["role"] == "user"
@@ -542,23 +840,124 @@ def test_agentic_loop_executes_tool_calls():
 
 
 # ============================================================
+# Memory Agentic Loop Test
+# ============================================================
+
+def test_agentic_loop_executes_save_memory():
+    """
+    Verify the full memory flow:
+
+    Gemini requests save_memory
+        ↓
+    Agent executes tool
+        ↓
+    ToolContext provides Memory
+        ↓
+    Memory.save() writes to disk
+        ↓
+    Agent continues the loop
+    """
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        memory_path = os.path.join(
+            tmpdir,
+            "memory.md",
+        )
+
+        memory = Memory(path=memory_path)
+
+        brain = FakeBrain(
+            responses=[
+                Thought(
+                    text="I'll remember that.",
+                    tool_calls=[
+                        ToolCall(
+                            id="memory-1",
+                            name="save_memory",
+                            args={
+                                "content": (
+                                    "User prefers Python "
+                                    "for programming."
+                                )
+                            },
+                        )
+                    ],
+                    raw_content={
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "I'll remember that."
+                            },
+                            {
+                                "functionCall": {
+                                    "name": "save_memory",
+                                    "args": {
+                                        "content": (
+                                            "User prefers Python "
+                                            "for programming."
+                                        )
+                                    },
+                                    "id": "memory-1",
+                                },
+                            },
+                        ],
+                    },
+                ),
+
+                Thought(
+                    text="I've saved that preference.",
+                    tool_calls=[],
+                ),
+            ]
+        )
+
+        agent = Agent(
+            brain=brain,
+            tools=tools,
+            memory=memory,
+        )
+
+        result = agent.handle_input(
+            "Remember that I prefer Python."
+        )
+
+        assert "I'll remember that." in result
+        assert "I've saved that preference." in result
+
+        assert brain.call_count == 2
+
+        assert (
+            memory.content
+            == "User prefers Python for programming."
+        )
+
+        with open(memory_path, encoding="utf-8") as f:
+            assert (
+                f.read()
+                == "User prefers Python for programming."
+            )
+
+
+# ============================================================
 # Gemini Conversation Conversion Tests
 # ============================================================
 
 def test_gemini_converts_tool_result_to_function_response():
     """
     Verify provider-neutral tool results are converted
-    into Gemini's functionResponse format.
+    into Gemini functionResponse format.
     """
 
-    brain = Gemini(
-        tools=tool_definitions(tools)
-    )
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        brain = Gemini(
+            tools=tool_definitions(tools)
+        )
 
     conversation = [
         {
             "role": "user",
-            "content": "Read the file"
+            "content": "Read the file",
         },
 
         {
@@ -572,11 +971,11 @@ def test_gemini_converts_tool_result_to_function_response():
                             "args": {
                                 "path": "test.txt"
                             },
-                            "id": "call-123"
+                            "id": "call-123",
                         }
                     }
-                ]
-            }
+                ],
+            },
         },
 
         {
@@ -586,19 +985,16 @@ def test_gemini_converts_tool_result_to_function_response():
                     "type": "tool_result",
                     "tool_call_id": "call-123",
                     "name": "read_file",
-                    "content": "1 | hello world"
+                    "content": "1 | hello world",
                 }
-            ]
-        }
+            ],
+        },
     ]
 
-    converted = (
-        brain._convert_conversation(
-            conversation
-        )
+    converted = brain._convert_conversation(
+        conversation
     )
 
-    # User message
     assert converted[0]["role"] == "user"
 
     assert (
@@ -606,7 +1002,6 @@ def test_gemini_converts_tool_result_to_function_response():
         == "Read the file"
     )
 
-    # Original model function call
     assert converted[1]["role"] == "model"
 
     function_call = (
@@ -616,7 +1011,6 @@ def test_gemini_converts_tool_result_to_function_response():
     assert function_call["name"] == "read_file"
     assert function_call["id"] == "call-123"
 
-    # Gemini function response
     assert converted[2]["role"] == "user"
 
     function_response = (
@@ -637,11 +1031,12 @@ def test_gemini_converts_tool_result_to_function_response():
 # ============================================================
 
 def test_gemini_parses_function_call():
-    """Verify Gemini functionCall is converted into ToolCall."""
+    """Verify Gemini functionCall becomes ToolCall."""
 
-    brain = Gemini(
-        tools=tool_definitions(tools)
-    )
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        brain = Gemini(
+            tools=tool_definitions(tools)
+        )
 
     response = {
         "candidates": [
@@ -655,18 +1050,16 @@ def test_gemini_parses_function_call():
                                 "args": {
                                     "path": "test.txt"
                                 },
-                                "id": "call-123"
+                                "id": "call-123",
                             }
                         }
-                    ]
+                    ],
                 }
             }
         ]
     }
 
-    thought = brain._parse_response(
-        response
-    )
+    thought = brain._parse_response(response)
 
     assert thought.text is None
 
@@ -683,7 +1076,6 @@ def test_gemini_parses_function_call():
         "path": "test.txt"
     }
 
-    # Original Gemini content should be preserved.
     assert (
         thought.raw_content
         == response["candidates"][0]["content"]
@@ -691,11 +1083,12 @@ def test_gemini_parses_function_call():
 
 
 def test_gemini_parses_text_response():
-    """Verify Gemini text response is converted into Thought."""
+    """Verify Gemini text response becomes Thought."""
 
-    brain = Gemini(
-        tools=tool_definitions(tools)
-    )
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        brain = Gemini(
+            tools=tool_definitions(tools)
+        )
 
     response = {
         "candidates": [
@@ -709,15 +1102,13 @@ def test_gemini_parses_text_response():
                                 "hello world."
                             )
                         }
-                    ]
+                    ],
                 }
             }
         ]
     }
 
-    thought = brain._parse_response(
-        response
-    )
+    thought = brain._parse_response(response)
 
     assert (
         thought.text
@@ -735,9 +1126,10 @@ def test_gemini_parses_text_response():
 def test_gemini_parses_thinking_response():
     """Verify Gemini thought parts are separated from normal text."""
 
-    brain = Gemini(
-        tools=tool_definitions(tools)
-    )
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        brain = Gemini(
+            tools=tool_definitions(tools)
+        )
 
     response = {
         "candidates": [
@@ -750,22 +1142,20 @@ def test_gemini_parses_thinking_response():
                                 "I need to inspect "
                                 "the file."
                             ),
-                            "thought": True
+                            "thought": True,
                         },
                         {
                             "text": (
                                 "I'll read the file now."
                             )
-                        }
-                    ]
+                        },
+                    ],
                 }
             }
         ]
     }
 
-    thought = brain._parse_response(
-        response
-    )
+    thought = brain._parse_response(response)
 
     assert (
         thought.thinking
@@ -778,3 +1168,135 @@ def test_gemini_parses_thinking_response():
     )
 
     assert thought.tool_calls == []
+
+
+# ============================================================
+# Gemini Memory Payload Tests
+# ============================================================
+
+def test_gemini_adds_memory_to_system_instruction():
+    """
+    Verify persistent memory is included in Gemini's
+    systemInstruction payload.
+    """
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        memory = Memory(
+            path=os.path.join(
+                tmpdir,
+                "memory.md",
+            )
+        )
+
+        memory.save(
+            "User prefers Python.\n"
+            "User uses Windows."
+        )
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "test-key"},
+        ):
+            brain = Gemini(
+                memory=memory,
+                tools=tool_definitions(tools),
+            )
+
+            mock_response = Mock()
+            mock_response.json.return_value = {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "text": "Hello"
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+            with patch(
+                "Ycode.request_with_retry",
+                return_value=mock_response,
+            ) as mock_request:
+
+                brain.think(
+                    [
+                        {
+                            "role": "user",
+                            "content": "Hello",
+                        }
+                    ]
+                )
+
+    payload = mock_request.call_args.kwargs["payload"]
+
+    assert "systemInstruction" in payload
+
+    system_instruction = payload[
+        "systemInstruction"
+    ]
+
+    assert "parts" in system_instruction
+    assert len(system_instruction["parts"]) == 1
+
+    system_text = (
+        system_instruction["parts"][0]["text"]
+    )
+
+    assert "=== MEMORY ===" in system_text
+    assert "=== END MEMORY ===" in system_text
+
+    assert "User prefers Python." in system_text
+    assert "User uses Windows." in system_text
+
+
+def test_gemini_without_memory_does_not_add_system_instruction():
+    """Verify Gemini does not add memory when none is provided."""
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "test-key"},
+    ):
+        brain = Gemini(
+            memory=None,
+            tools=tool_definitions(tools),
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "Hello"
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        with patch(
+            "Ycode.request_with_retry",
+            return_value=mock_response,
+        ) as mock_request:
+
+            brain.think(
+                [
+                    {
+                        "role": "user",
+                        "content": "Hello",
+                    }
+                ]
+            )
+
+    payload = mock_request.call_args.kwargs["payload"]
+
+    assert "systemInstruction" not in payload

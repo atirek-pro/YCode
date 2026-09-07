@@ -1,3 +1,4 @@
+import sys
 import os
 import time
 import requests
@@ -119,6 +120,7 @@ class Gemini(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("GEMINI_API_KEY")
 
         if not self.api_key:
@@ -154,22 +156,35 @@ class Gemini(Brain):
             }
         }
 
+        system_parts = []
+
+        if self.system:
+            system_parts.append({
+                "text": self.system
+            })
+
+        # Persistent memory
         if self.memory and self.memory.content.strip():
+            system_parts.append({
+                "text": (
+                    "You are Ycode, a helpful coding assistant.\n\n"
+                    "Here is your persistent memory. "
+                    "Use it to maintain context about the user "
+                    "and previous interactions. "
+                    "Do not mention or expose the memory system "
+                    "unless relevant.\n\n"
+                    "=== MEMORY ===\n"
+                    f"{self.memory.content}\n"
+                    "=== END MEMORY ==="
+                )
+            })
+
+        if system_parts:
             payload["systemInstruction"] = {
-                "parts": [ 
-                    { 
-                        "text": ( 
-                            "You are Ycode, a helpful coding assistant.\n\n" "Here is your persistent memory. " 
-                            "Use it to maintain context about the user " "and previous interactions. " 
-                            "Do not mention or expose the memory system " 
-                            "unless relevant.\n\n" "=== MEMORY ===\n" 
-                            f"{self.memory.content}\n" 
-                            "=== END MEMORY ===" 
-                        ) 
-                    } 
-                ]
+                "parts": system_parts
             }
 
+        # Tools
         gemini_tools = self._convert_tools()
         
         if gemini_tools:
@@ -346,6 +361,7 @@ BRAINS = {
 class ReadFile:
     "Reads a file from the filesystem"
     name = "read_file"
+    plan_safe = True
     description = "Reads a file from the filesystem. Use the to examine code."
     input_schema = {
         "type": "object",
@@ -368,6 +384,7 @@ class ReadFile:
 class WriteFile:
     "Write content to a file"
     name = "write_file"
+    plan_safe = False
     description = "Writes content to a file OVERWRITES existing content"
     input_schema = {
         "type": "object",
@@ -393,9 +410,32 @@ class WriteFile:
         except Exception as e:
             return f"Error writting file: {e}"
 
+class WritePlan:
+    "Save a plan to Plan.md"
+    name = "write_plan"
+    plan_safe = True
+    description = "Saves a plan to PLAN.md. Use this to outline your approach before making changes."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The plan content in markdown"}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print("--> Writing PLAN.md")
+        try:
+            with open("PLAN.md", "w", encoding="utf-8") as f:
+                f.write(content)
+            return "Plan saved to PLAN.md"
+        except Exception as e:
+            return f"Error saving Plan: {e}"
+
 class Savememory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
+    plan_safe = True
     description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
     input_schema = {
         "type": "object",
@@ -429,19 +469,40 @@ def tool_definitions(tools):
         for t in tools
     ]
 
-tools = [ReadFile(), WriteFile(), Savememory()]
+tools = [ReadFile(), WritePlan(), Savememory(), WriteFile()]
 
 # --- Agent Class ---
 
 class Agent:
     """A coding agent with conversation memory."""
 
-    def __init__(self, brain, tools, memory, brain_name="gemini"):
+    def __init__(self, brain, tools, memory=None, mode="plan", brain_name="gemini"):
         self.brain = brain
         self.tools = list(tools)
         self.memory = memory
+        self.mode = mode
         self.brain_name = brain_name
         self.conversation = []
+        self.brain.tools = self._tools_for_mode()
+        self.brain.system = self._build_system_prompt()
+
+    def _build_system_prompt(self):
+        "Build system prompt from memory and current mode."
+        parts = [self.memory.content] if self.memory else []
+
+        if self.mode == "plan":
+            parts.append(
+                "You are in PLAN mode. You cannot write code files. "
+                "Use write_plan to save your plans to PLAN.md."
+            )
+
+        return "\n".join(parts)
+
+    def _tools_for_mode(self):
+        "Return tool definations based on current mode."
+        if self.mode == "act":
+            return tool_definitions(self.tools)
+        return tool_definitions([t for t in self.tools if t.plan_safe])
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
@@ -455,6 +516,10 @@ class Agent:
         if not user_input.strip():
             return ""
 
+        # handle mode switching
+        if user_input.strip().startswith("/mode"):
+            return self._handle_mode_command(user_input)
+
         self.conversation.append({
             "role": "user",
             "content": user_input
@@ -465,6 +530,20 @@ class Agent:
 
         except Exception as e:
             return f"Error: {e}"
+
+    def _handle_mode_command(self, user_input):
+        "Handle /mode command to switch between plan and act"
+        parts = user_input.strip().split()
+        if len(parts) > 1 and parts[1] == "act":
+            self.mode = "act"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "⚠️  Switched to ACT MODE (Writing Enabled)"
+        else:
+            self.mode = "plan"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "🛡️  Switched to PLAN MODE (Code Read-Only)"
 
     def _switch_brain(self):
         "Toggle to the next brain"
@@ -572,13 +651,19 @@ class Agent:
 # --- Main Loop ---
 
 def main():
+    # parse mode from CLI
+    mode = "act" if len(sys.argv) > 1 and sys.argv[1] == "--act" else "plan"
     brain_name = os.getenv("YCode_BRAIN", "gemini")
     memory = Memory()
     brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
-    agent = Agent(brain=brain, tools=tools, memory=memory, brain_name=brain_name)
-    print("⚡ Nanocode v0.5 (Memory Enabled)")
-    print(f"Commands: /q quit, /switch toggle brain")
+    agent = Agent(brain=brain, tools=tools, memory=memory, brain_name=brain_name, mode=mode)
+    print("⚡ Nanocode v0.6")
+    print(f"Commands: /q quit, /switch toggle brain, mode[plan | act]")
     print(f"Brain: {brain_name}\n")
+    if mode == "act":
+        print("MODE: ACT (WRITING ENABLED)")
+    else:
+        print("Mode: PLAN (Code Read-Only)")
 
     while True:
         try:

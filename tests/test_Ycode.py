@@ -1300,3 +1300,44 @@ def test_gemini_without_memory_does_not_add_system_instruction():
     payload = mock_request.call_args.kwargs["payload"]
 
     assert "systemInstruction" not in payload
+
+# --- Mode tests ---
+
+def test_agent_defaults_to_plan_mode():
+    """Verify agent starts in plan mode by default."""
+    agent = Agent(brain=FakeBrain(), tools=tools)
+    assert agent.mode == "plan"
+
+def test_plan_mode_hides_write_file():
+    """Verify plan mode does not expose write_file to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" not in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+def test_act_mode_shows_all_tools():
+    """Verify act mode exposes all tools to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+def test_mode_command_switches_to_plan():
+    """Verify /mode plan switches to plan mode."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    result = agent.handle_input("/mode plan")
+
+    assert agent.mode == "plan"
+    assert "PLAN" in result
+
+def test_mode_command_switches_to_act():
+    """Verify /mode act switches to act mode."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    result = agent.handle_input("/mode act")
+
+    assert agent.mode == "act"
+    assert "ACT" in result

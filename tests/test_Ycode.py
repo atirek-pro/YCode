@@ -13,12 +13,14 @@ from Ycode import (
     BRAINS,
     ReadFile,
     WriteFile,
-    Savememory,
+    SaveMemory,
     Gemini,
     Memory,
     ToolContext,
     tool_definitions,
     tools,
+    ListFiles,
+    SearchCodebase
 )
 
 
@@ -368,9 +370,9 @@ def test_write_file_has_valid_input_schema():
 
 
 def test_save_memory_has_valid_input_schema():
-    """Verify Savememory has the expected schema."""
+    """Verify SaveMemory has the expected schema."""
 
-    tool = Savememory()
+    tool = SaveMemory()
 
     assert tool.name == "save_memory"
     assert tool.input_schema["type"] == "object"
@@ -383,7 +385,7 @@ def test_tool_definitions_are_provider_neutral():
 
     definitions = tool_definitions(tools)
 
-    assert len(definitions) == 3
+    assert len(definitions) == 6
 
     names = {tool["name"] for tool in definitions}
 
@@ -423,7 +425,7 @@ def test_gemini_converts_tools_to_function_declarations():
         "functionDeclarations"
     ]
 
-    assert len(function_declarations) == 3
+    assert len(function_declarations) == 6
 
     read_file = next(
         tool
@@ -449,8 +451,8 @@ def test_gemini_converts_tools_to_function_declarations():
     assert write_file["description"] == WriteFile.description
     assert write_file["parameters"] == WriteFile.input_schema
 
-    assert save_memory["description"] == Savememory.description
-    assert save_memory["parameters"] == Savememory.input_schema
+    assert save_memory["description"] == SaveMemory.description
+    assert save_memory["parameters"] == SaveMemory.input_schema
 
 
 # ============================================================
@@ -602,7 +604,7 @@ def test_tool_context_contains_memory():
 # ============================================================
 
 def test_save_memory_updates_memory():
-    """Verify Savememory updates the Memory object."""
+    """Verify SaveMemory updates the Memory object."""
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
@@ -613,7 +615,7 @@ def test_save_memory_updates_memory():
             )
         )
 
-        tool = Savememory()
+        tool = SaveMemory()
         context = ToolContext(memory=memory)
 
         result = tool.execute(
@@ -631,7 +633,7 @@ def test_save_memory_updates_memory():
 def test_save_memory_without_memory_returns_error():
     """Verify SaveMemory handles missing memory context."""
 
-    tool = Savememory()
+    tool = SaveMemory()
     context = ToolContext(memory=None)
 
     result = tool.execute(
@@ -1341,3 +1343,71 @@ def test_mode_command_switches_to_act():
 
     assert agent.mode == "act"
     assert "ACT" in result
+
+# --- New tests for Chapter 8: Awareness tools ---
+
+def test_list_files_returns_file_tree():
+    """Verify ListFiles returns a tree structure."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create some test files
+        os.makedirs(os.path.join(tmpdir, "src"))
+        with open(os.path.join(tmpdir, "README.md"), 'w') as f:
+            f.write("# Test")
+        with open(os.path.join(tmpdir, "src", "main.py"), 'w') as f:
+            f.write("print('hello')")
+
+        tool = ListFiles()
+        context = ToolContext()
+        result = tool.execute(context, path=tmpdir)
+
+        assert "README.md" in result
+        assert "src/" in result
+        assert "main.py" in result
+
+def test_list_files_skips_git_and_pycache():
+    """Verify ListFiles skips .git and __pycache__ directories."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create directories that should be skipped
+        os.makedirs(os.path.join(tmpdir, ".git"))
+        os.makedirs(os.path.join(tmpdir, "__pycache__"))
+        os.makedirs(os.path.join(tmpdir, "src"))
+
+        with open(os.path.join(tmpdir, ".git", "config"), 'w') as f:
+            f.write("git config")
+        with open(os.path.join(tmpdir, "__pycache__", "cache.pyc"), 'w') as f:
+            f.write("cache")
+        with open(os.path.join(tmpdir, "src", "main.py"), 'w') as f:
+            f.write("print('hello')")
+
+        tool = ListFiles()
+        context = ToolContext()
+        result = tool.execute(context, path=tmpdir)
+
+        assert "config" not in result
+        assert "cache.pyc" not in result
+        assert "main.py" in result
+
+def test_search_codebase_finds_matches():
+    """Verify SearchCodebase finds text in files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "test.py"), 'w') as f:
+            f.write("def hello_world():\n    print('hello')\n")
+
+        tool = SearchCodebase()
+        context = ToolContext()
+        result = tool.execute(context, query="hello_world", path=tmpdir)
+
+        assert "test.py" in result
+        assert "hello_world" in result
+        assert ":1:" in result  # Line number
+
+def test_search_codebase_case_insensitive():
+    """Verify SearchCodebase is case-insensitive."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "test.py"), 'w') as f:
+            f.write("def HelloWorld():\n    pass\n")
+
+        tool = SearchCodebase()
+        context = ToolContext()
+        result = tool.execute(context, query="helloworld", path=tmpdir)
+        assert "HelloWorld" in result

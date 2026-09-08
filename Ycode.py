@@ -432,7 +432,71 @@ class WritePlan:
         except Exception as e:
             return f"Error saving Plan: {e}"
 
-class Savememory:
+class ListFiles:
+    """Lists files in the project structure."""
+    name = "list_files"
+    plan_safe = True
+    description = "Lists all files in the project structure. Useful to understand the project layout."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "The root path (default '.')"}
+        }
+    }
+
+    def execute(self, context, path="."):
+        print(f"-> Listing {path}")
+        try:
+            file_list = []
+            for root, dirs, files in os.walk(path):
+
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".Ycode", ".venv", "myenv"}]
+
+                level = root.replace(path, '').count(os.sep)
+                indent = ' ' * 4 * (level)
+                file_list.append(f"{indent}{os.path.basename(root)}/")
+                subindent = ' ' * 4 * (level + 1)
+
+                for f in files:
+                    file_list.append(f"{subindent}{f}")
+            return "\n".join(file_list)
+        except Exception as e:
+            return f"Error Listing Files: {e}"
+
+class SearchCodebase:
+    "Searches for a string in all files"
+    name = "search_codebase"
+    plan_safe = True
+    description = "Searches the entire codebase for a text string. Useful to find where functions or variables are defined."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The string to search for"},
+            "path": {"type": "string", "description": "The root path (default '.')"}
+        },
+        "required": ["query"]
+    }
+
+    def execute(self, context, query, path="."):
+        print(f"-> Searching for '{query}'")
+        results = []
+        try:
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in {".get", "__pycache__", "venv", ".Ycode", ".venv", "myenv"}]
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            for i, line in enumerate(f):
+                                if query.lower() in line.lower():
+                                    results.append(f"{file_path}:{i+1}: {line.strip()}")
+                    except Exception:
+                        continue
+            return "\n".join(results) if results else "No Matches found."
+        except Exception as e:
+            return f"Error Searching: {e}"
+
+class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
     plan_safe = True
@@ -469,7 +533,7 @@ def tool_definitions(tools):
         for t in tools
     ]
 
-tools = [ReadFile(), WritePlan(), Savememory(), WriteFile()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile()]
 
 # --- Agent Class ---
 

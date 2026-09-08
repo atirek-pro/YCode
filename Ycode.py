@@ -1,7 +1,8 @@
-import sys
 import os
+import sys
 import time
 import requests
+import subprocess
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -104,6 +105,9 @@ class ToolContext:
 class Brain:
     """Base class for LLM providers."""
 
+    context_limit = 200_000
+    last_input_token = 0
+
     def think(self, conversation):
         """Process conversation and return a Thought."""
         raise NotImplementedError
@@ -116,6 +120,8 @@ class Brain:
 
 class Gemini(Brain):
     """Gemini API - the brain of our agent."""
+
+    context_limit = 1_048_576
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
@@ -195,6 +201,10 @@ class Gemini(Brain):
             headers=headers,
             payload=payload
         )
+
+        data = response.json()
+        usage = data.get("usageMetadata", {})
+        self.last_input_tokens = usage.get("promptTokenCount", 0)
 
         return self._parse_response(response.json())
 
@@ -432,6 +442,35 @@ class WritePlan:
         except Exception as e:
             return f"Error saving Plan: {e}"
 
+class EditFile:
+    """Replaces text in a file (surgical edit)."""
+    name = "edit_file"
+    plan_safe = False
+    description = "Replaces specific text in a file. Use for surgical edits instead of rewriting entire files."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "old_text": {"type": "string", "description": "Exact text to find and replace"},
+            "new_text": {"type": "string", "description": "Text to replace it with"}
+        },
+        "required": ["path", "old_text", "new_text"]
+    }    
+
+    def execute(self, context, path, old_text, new_text):
+        print(f"--> Editing {path}")
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if old_text not in content:
+                return f"Error: Could not find the specified text in {path}"
+            new_content = content.replace(old_text, new_text, 1)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            return f"Successfully edited {path}"
+        except Exception as e:
+            return f"Error editing file: {e}"
+
 class ListFiles:
     """Lists files in the project structure."""
     name = "list_files"
@@ -516,6 +555,45 @@ class SaveMemory:
         context.memory.save(content)
         return "Memory updated successfully"
 
+class RunCommand:
+    """Executes shell commands."""
+    name = "run_command"
+    plan_safe = False
+    description = "Executes a terminal command. Use this to run scripts, tests, or install packages."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "The shell command to run (e.g., 'python test.py')"}
+        },
+        "required": ["command"]
+    }
+
+    def execute(self, context, command):
+        print(f"-> Running: {command[:50]}...")
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=int(os.environ.get("YCODE_TIMEOUT", "30")),
+                cwd=os.getcwd()
+            )
+
+            output = ""
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n"
+            if not output:
+                output = "(NO OUTPUT)"
+
+            return output.strip() 
+
+        except subprocess.TimeoutExpired:
+            return "Error: Command Timed out."
+        except Exception as e:
+            return f"Error executing command: {e}"
 
 # Tool helpers
 def get_tool(tools, name):
@@ -533,7 +611,7 @@ def tool_definitions(tools):
         for t in tools
     ]
 
-tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), RunCommand(), EditFile()]
 
 # --- Agent Class ---
 
@@ -626,9 +704,10 @@ class Agent:
         """Process brain responses, executing tools until done."""
 
         output_parts = []
+        max_iterations = 50
 
-        while True:
-
+        for _iteration in range(max_iterations):
+            # Ask brain
             thought = self.brain.think(self.conversation)
 
             # ---------------------------------------------
@@ -646,6 +725,16 @@ class Agent:
                     print(
                         f"\033[2m{prefix}{line}\033[0m"
                     )
+            
+            # ---------------------------------------------
+            # Compact if approaching context limit
+            # ---------------------------------------------
+
+            if self.brain.last_input_tokens > self.brain.context_limit * 0.75:
+                self._compact_conversation()
+
+            # Store raw content for message history
+            self.conversation.append({"role": "assistant", "content": thought.raw_content})
 
             # ---------------------------------------------
             # Collect text output
@@ -660,15 +749,6 @@ class Agent:
 
             if not thought.tool_calls:
                 break
-
-            # ---------------------------------------------
-            # Preserve Gemini model response
-            # ---------------------------------------------
-
-            self.conversation.append({
-                "role": "assistant",
-                "content": thought.raw_content
-            })
 
             # ---------------------------------------------
             # Execute tools
@@ -699,7 +779,46 @@ class Agent:
                 "content": tool_results
             })
 
+        else:
+            output_parts.append("(STOPPED: too many iterations)")
+
         return "\n".join(output_parts)
+
+    def _compact_conversation(self):
+        """Summarize old messages to stay within context limits."""
+
+        print("(Compacting Conversation...)")
+
+        history = "\n".join(
+            f"{m['role']}: {str(m['content'])[:500]}"
+            for m in self.conversation
+        )
+
+        prompt = [{
+            "role": "user",
+            "content": (
+                "Summarize this conversation for continuity. "
+                "Focus on what was accomplished, what's in progress, "
+                "and key decisions:\n\n"
+                f"{history}"
+            )
+        }]
+
+        saved_tools = self.brain.tools
+        self.brain.tools = []
+
+        try:
+            thought = self.brain.think(prompt)
+        finally:
+            self.brain.tools = saved_tools
+
+        self.conversation = [{
+            "role": "user",
+            "content": (
+                "Previous conversation summary:\n\n"
+                f"{thought.text}"
+            )
+        }]
 
     def _execute_tool(self, name, args):
         """Execute a tool by name with given arguments."""

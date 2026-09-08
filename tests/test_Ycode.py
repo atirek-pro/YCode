@@ -20,6 +20,8 @@ from Ycode import (
     tool_definitions,
     tools,
     ListFiles,
+    RunCommand,
+    EditFile,
     SearchCodebase
 )
 
@@ -1411,3 +1413,54 @@ def test_search_codebase_case_insensitive():
         context = ToolContext()
         result = tool.execute(context, query="helloworld", path=tmpdir)
         assert "HelloWorld" in result
+
+# --- New tests for Chapter 9: RunCommand tool ---
+
+def test_run_command_executes():
+    """Verify run_command executes a command."""
+    tool = RunCommand()
+    context = ToolContext()
+    result = tool.execute(context, command="echo hello")
+
+    assert "STDOUT" in result
+    assert "hello" in result
+
+def test_run_command_captures_stderr():
+    """Verify run_command captures error output."""
+    tool = RunCommand()
+    context = ToolContext()
+    result = tool.execute(context, command="python -c \"import sys; sys.stderr.write('error!')\"")
+
+    assert "STDERR" in result
+    assert "error!" in result
+
+def test_run_coomand_timeout(monkeypatch):
+    "Verify run_command times out on long-running commands"
+    monkeypatch.setenv("YCODE_TIMEOUT", "1")
+    tool = RunCommand()
+    context = ToolContext()
+    result = tool.execute(context, command="sleep 100")
+
+    assert "timed out" in result
+
+# --- EditFile Tests ---
+
+def test_edit_file_replaces_text():
+    """Verify EditFile replaces text in a file."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write("x = 1\ny = 2\nz = 3\n")
+        temp_path = f.name
+
+    try:
+        tool = EditFile()
+        context = ToolContext()
+        result = tool.execute(context, temp_path, "y = 2", "y = 42")
+
+        assert "Successfully" in result
+        with open(temp_path) as f:
+            content = f.read()
+        assert "y = 42" in content
+        assert "y = 2" not in content
+    finally:
+        os.unlink(temp_path)
+

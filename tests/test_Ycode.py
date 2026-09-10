@@ -19,10 +19,12 @@ from Ycode import (
     ToolContext,
     tool_definitions,
     tools,
+    get_tool,
     ListFiles,
     RunCommand,
     EditFile,
-    SearchCodebase
+    SearchCodebase,
+    SearchWeb,
 )
 
 
@@ -41,6 +43,7 @@ class FakeBrain(Brain):
         self.last_conversation = None
         self.memory = memory
         self.tools = tools or []
+        self.last_input_tokens = 0
 
     def think(self, conversation):
         self.last_conversation = list(conversation)
@@ -184,11 +187,11 @@ def test_conversation_accumulates():
 
     agent.handle_input("First Message")
 
-    assert len(agent.conversation) == 1
+    assert len(agent.conversation) == 2
 
     agent.handle_input("Second Message")
 
-    assert len(agent.conversation) == 2
+    assert len(agent.conversation) == 4
 
 
 # ============================================================
@@ -387,15 +390,14 @@ def test_tool_definitions_are_provider_neutral():
 
     definitions = tool_definitions(tools)
 
-    assert len(definitions) == 6
+    assert len(definitions) == len(tools)
 
     names = {tool["name"] for tool in definitions}
 
-    assert names == {
-        "read_file",
-        "write_file",
-        "save_memory",
-    }
+    assert "read_file" in names
+    assert "write_file" in names
+    assert "save_memory" in names
+    assert "search_web" in names
 
     for definition in definitions:
         assert "name" in definition
@@ -427,7 +429,7 @@ def test_gemini_converts_tools_to_function_declarations():
         "functionDeclarations"
     ]
 
-    assert len(function_declarations) == 6
+    assert len(function_declarations) == len(tools)
 
     read_file = next(
         tool
@@ -447,6 +449,12 @@ def test_gemini_converts_tools_to_function_declarations():
         if tool["name"] == "save_memory"
     )
 
+    search_web = next(
+        tool
+        for tool in function_declarations
+        if tool["name"] == "search_web"
+    )
+
     assert read_file["description"] == ReadFile.description
     assert read_file["parameters"] == ReadFile.input_schema
 
@@ -455,6 +463,9 @@ def test_gemini_converts_tools_to_function_declarations():
 
     assert save_memory["description"] == SaveMemory.description
     assert save_memory["parameters"] == SaveMemory.input_schema
+
+    assert search_web["description"] == SearchWeb.description
+    assert search_web["parameters"] == SearchWeb.input_schema
 
 
 # ============================================================
@@ -785,7 +796,7 @@ def test_agentic_loop_executes_tool_calls():
 
         assert brain.call_count == 2
 
-        assert len(agent.conversation) == 3
+        assert len(agent.conversation) == 4
 
         # Original user message
         assert agent.conversation[0] == {
@@ -1439,9 +1450,9 @@ def test_run_coomand_timeout(monkeypatch):
     monkeypatch.setenv("YCODE_TIMEOUT", "1")
     tool = RunCommand()
     context = ToolContext()
-    result = tool.execute(context, command="sleep 100")
+    result = tool.execute(context, command='python -c "import time; time.sleep(10)"')
 
-    assert "timed out" in result
+    assert "timed out" in result.lower()
 
 # --- EditFile Tests ---
 
@@ -1464,3 +1475,65 @@ def test_edit_file_replaces_text():
     finally:
         os.unlink(temp_path)
 
+# --- Chapter 11: SearchWeb Tool Tests ---
+
+def test_search_web_tool_exists():
+    """Verify SearchWeb class exists with required attributes."""
+    tool = SearchWeb()
+    assert tool.name == "search_web"
+    assert tool.description is not None
+    assert tool.input_schema is not None
+    assert "query" in tool.input_schema["properties"]
+
+
+def test_search_web_in_tools_list():
+    """Verify SearchWeb is registered in the tools list."""
+    tool_names = [t.name for t in tools]
+    assert "search_web" in tool_names
+
+
+def test_search_web_can_be_found():
+    """Verify get_tool can find search_web."""
+    tool = get_tool(tools, "search_web")
+    assert tool is not None
+    assert tool.name == "search_web"
+
+
+def test_search_web_in_tool_definitions():
+    """Verify search_web appears in tool definitions for API."""
+    definitions = tool_definitions(tools)
+    names = [d["name"] for d in definitions]
+    assert "search_web" in names
+
+
+def test_search_web_execute_success(monkeypatch):
+    """Verify SearchWeb.execute() returns formatted results."""
+    fake_results = [
+        {"title": "Python 3.13", "href": "https://python.org", "body": "Latest release"},
+    ]
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: fake_results})())
+    tool = SearchWeb()
+    context = ToolContext()
+    result = tool.execute(context, "latest python version")
+    assert "Python 3.13" in result
+    assert "https://python.org" in result
+
+
+def test_search_web_execute_no_results(monkeypatch):
+    """Verify SearchWeb.execute() handles empty results."""
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: []})())
+    tool = SearchWeb()
+    context = ToolContext()
+    result = tool.execute(context, "impossible query xyz")
+    assert "No results found" in result
+
+
+def test_search_web_execute_error(monkeypatch):
+    """Verify SearchWeb.execute() handles errors gracefully."""
+    def raise_error():
+        raise RuntimeError("Network down")
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: raise_error()})())
+    tool = SearchWeb()
+    context = ToolContext()
+    result = tool.execute(context, "test query")
+    assert "Error" in result

@@ -1,8 +1,17 @@
 import os
 import sys
 import time
+import re
+import html
+import urllib.parse
 import requests
 import subprocess
+
+try:
+    from ddgs import DDGS
+except ImportError:
+    DDGS = None
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -106,7 +115,7 @@ class Brain:
     """Base class for LLM providers."""
 
     context_limit = 200_000
-    last_input_token = 0
+    last_input_tokens = 0
 
     def think(self, conversation):
         """Process conversation and return a Thought."""
@@ -535,6 +544,37 @@ class SearchCodebase:
         except Exception as e:
             return f"Error Searching: {e}"
 
+class SearchWeb:
+    """Searches the internet using DuckDuckGo."""
+    name = "search_web"
+    plan_safe = True
+    description = "Searches the internet for current information. Use when you need knowledge beyond your training data."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"}
+        },
+        "required": ["query"]
+    }
+
+    def execute(self, context, query):
+        print(f"  → Searching web for '{query}'")
+        if DDGS is None:
+            return "Error: ddgs package not installed. Run: pip install ddgs"
+        try:
+            results = DDGS().text(query, max_results=3)
+            if not results:
+                return "No results found."
+
+            formatted = []
+            for r in results:
+                formatted.append(f"Title: {r['title']}\nURL: {r['href']}\nSummary: {r['body']}\n")
+
+            return "\n".join(formatted)
+        except Exception as e:
+            return f"Error searching web: {e}"
+
+
 class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
@@ -611,7 +651,7 @@ def tool_definitions(tools):
         for t in tools
     ]
 
-tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), RunCommand(), EditFile()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), SearchWeb(), WriteFile(), RunCommand(), EditFile()]
 
 # --- Agent Class ---
 

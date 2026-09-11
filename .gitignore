@@ -5,3 +5,5 @@ pytest.ini
 .env
 .DS_Store
 .Ycode-Memory/
+games/.env
+games/Ycode.py

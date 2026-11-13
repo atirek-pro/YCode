@@ -1235,7 +1235,7 @@ def test_gemini_adds_memory_to_system_instruction():
             }
 
             with patch(
-                "Ycode.request_with_retry",
+                "brain.request_with_retry",
                 return_value=mock_response,
             ) as mock_request:
 
@@ -1299,7 +1299,7 @@ def test_gemini_without_memory_does_not_add_system_instruction():
         }
 
         with patch(
-            "Ycode.request_with_retry",
+            "brain.request_with_retry",
             return_value=mock_response,
         ) as mock_request:
 

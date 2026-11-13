@@ -1,4 +1,4 @@
-venv/
+YCode-Env/
 __pycache__/
 .pytest_cache/
 pytest.ini
@@ -7,3 +7,4 @@ pytest.ini
 .Ycode-Memory/
 games/.env
 games/Ycode.py
+resume-with.txt
